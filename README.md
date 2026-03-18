@@ -37,27 +37,7 @@ RoadBot AI คือ Chatbot ที่ช่วยให้ผู้ใช้ส
 
 ## 🧩 System Architecture
 
-```mermaid
-flowchart TD
-    A[User (Web / LINE / Discord)] --> B[Webhook Trigger]
-
-    B --> C[AI Agent (Analyze Question)]
-
-    C --> D{Intent Type?}
-
-    D -- Accident Data --> E[Query Dataset (CSV/DB)]
-    D -- General Question --> F[OpenAI API]
-
-    E --> G[Format Data (Code Node)]
-    F --> G
-
-    G --> H[Generate Answer]
-
-    H --> I[Send Response to User]
-
-    E -- Error --> J[Log Error]
-    F -- Error --> J
-```
+![RoadBot Workflow](./assets/workflow.png)
 
 ---
 
