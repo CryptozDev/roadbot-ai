@@ -37,7 +37,7 @@ RoadBot AI คือ Chatbot ที่ช่วยให้ผู้ใช้ส
 
 ## 🧩 System Architecture
 
-![RoadBot Workflow](./assets/workflow.png)
+![RoadBot Workflow](./assets/workflow-diagram.png)
 
 ---
 
