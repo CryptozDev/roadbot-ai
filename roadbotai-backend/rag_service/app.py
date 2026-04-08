@@ -1,3 +1,4 @@
+import heapq
 import json
 import os
 import re
@@ -938,16 +939,23 @@ def filter_unreasonable_waypoints(
             force_include_waypoints=False,
         )
 
+        route_signal_reliable = len(base_route) >= 3 and len(route_with_waypoint) >= 3
+        route_misses_waypoint = (
+            route_signal_reliable
+            and waypoint not in base_route
+            and waypoint not in route_with_waypoint
+        )
+
         if direct_km is not None and via_km is not None and extra_km is not None:
             ratio = via_km / direct_km if direct_km > 0 else 999
             if via_km > direct_km * 1.45 and extra_km > 180:
                 keep = False
                 reason = f"ทำให้เส้นทางอ้อมเพิ่มประมาณ {extra_km:.0f} กม. ({ratio:.2f} เท่าของเส้นทางตรง)"
-            elif base_route and waypoint not in base_route and route_with_waypoint and waypoint not in route_with_waypoint:
+            elif route_misses_waypoint and (via_km > direct_km * 1.20 or extra_km > 120):
                 keep = False
                 reason = "ไม่อยู่ในแนวเส้นทางหลักที่ระบบคำนวณใหม่ได้"
         else:
-            if base_route and waypoint not in base_route and route_with_waypoint and waypoint not in route_with_waypoint:
+            if route_misses_waypoint:
                 keep = False
                 reason = "ไม่อยู่ในแนวเส้นทางหลักที่ระบบคำนวณใหม่ได้"
 
@@ -979,6 +987,119 @@ def reverse_geocode_province(lat: float, lng: float) -> str | None:
         return None
 
 
+def get_province_centroids() -> dict[str, tuple[float, float]]:
+    df = _state.get("df")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {}
+    if not {"province", "lat", "lng"}.issubset(df.columns):
+        return {}
+
+    points = df[["province", "lat", "lng"]].copy()
+    points["lat"] = pd.to_numeric(points["lat"], errors="coerce")
+    points["lng"] = pd.to_numeric(points["lng"], errors="coerce")
+    points = points.dropna(subset=["province", "lat", "lng"])
+
+    centroids: dict[str, tuple[float, float]] = {}
+    for province, group in points.groupby("province"):
+        normalized = normalize_province_name(str(province))
+        if normalized:
+            centroids[normalized] = (float(group["lat"].mean()), float(group["lng"].mean()))
+    return centroids
+
+
+def get_province_position(province: str) -> tuple[float | None, float | None]:
+    normalized = normalize_province_name(province) or province
+    centroids = get_province_centroids()
+    if normalized in centroids:
+        return centroids[normalized]
+    return geocode(normalized)
+
+
+def estimate_leg_provinces_from_centroids(origin: str, destination: str) -> list[str]:
+    origin = normalize_province_name(origin) or origin
+    destination = normalize_province_name(destination) or destination
+    centroids = get_province_centroids()
+
+    if origin not in centroids or destination not in centroids:
+        orig_lat, orig_lng = get_province_position(origin)
+        dest_lat, dest_lng = get_province_position(destination)
+        if None in (orig_lat, orig_lng, dest_lat, dest_lng):
+            return combine_ordered_provinces(origin, destination)
+        return combine_ordered_provinces(origin, destination)
+
+    def province_distance(first: str, second: str) -> float:
+        first_lat, first_lng = centroids[first]
+        second_lat, second_lng = centroids[second]
+        return haversine_km(first_lat, first_lng, second_lat, second_lng)
+
+    direct_km = province_distance(origin, destination)
+    if direct_km <= 1:
+        return combine_ordered_provinces(origin, destination)
+
+    max_edge_km = 150.0 if direct_km < 260 else 170.0
+    neighbor_limit = 12
+    progress_slack_km = 30.0
+    graph: dict[str, list[tuple[str, float]]] = {}
+
+    for province in centroids:
+        candidates: list[tuple[float, str]] = []
+        current_goal_km = province_distance(province, destination)
+        for other in centroids:
+            if other == province:
+                continue
+            edge_km = province_distance(province, other)
+            if edge_km <= max_edge_km and province_distance(other, destination) <= current_goal_km + progress_slack_km:
+                candidates.append((edge_km, other))
+        candidates.sort(key=lambda item: item[0])
+        graph[province] = [(other, edge_km) for edge_km, other in candidates[:neighbor_limit]]
+
+    queue: list[tuple[float, str]] = [(province_distance(origin, destination), origin)]
+    costs: dict[str, float] = {origin: 0.0}
+    previous: dict[str, str] = {}
+    visited: set[str] = set()
+
+    while queue:
+        _, current = heapq.heappop(queue)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        if current == destination:
+            break
+
+        for neighbor, edge_km in graph.get(current, []):
+            step_cost = (max(edge_km, 1.0) ** 1.4) / (100.0 ** 0.4)
+            new_cost = costs[current] + step_cost
+            if new_cost < costs.get(neighbor, float("inf")):
+                costs[neighbor] = new_cost
+                previous[neighbor] = current
+                priority = new_cost + (province_distance(neighbor, destination) / 100.0)
+                heapq.heappush(queue, (priority, neighbor))
+
+    if destination == origin:
+        return [origin]
+    if destination not in previous:
+        return combine_ordered_provinces(origin, destination)
+
+    path = [destination]
+    while path[-1] != origin:
+        prior = previous.get(path[-1])
+        if prior is None:
+            return combine_ordered_provinces(origin, destination)
+        path.append(prior)
+
+    path.reverse()
+    return combine_ordered_provinces(path)
+
+
+def estimate_route_from_centroids(origin: str, destination: str, waypoints: list[str] | None = None) -> list[str]:
+    stops = combine_ordered_provinces(origin, waypoints or [], destination)
+    estimated: list[str] = []
+    for leg_origin, leg_destination in zip(stops, stops[1:]):
+        estimated = combine_ordered_provinces(estimated, estimate_leg_provinces_from_centroids(leg_origin, leg_destination))
+    return estimated
+
+
 def build_sensible_route(
     origin: str,
     destination: str,
@@ -987,74 +1108,102 @@ def build_sensible_route(
 ) -> list[str]:
     waypoints = combine_ordered_provinces(waypoints or [])
     observed_provinces = combine_ordered_provinces(observed_provinces or [])
+    stops = combine_ordered_provinces(origin, waypoints, destination)
 
-    backbone = infer_route_provinces_with_llm(
-        origin,
-        destination,
-        waypoints,
-        include_waypoints=bool(waypoints),
-        force_include_waypoints=True,
-    )
+    if observed_provinces:
+        observed_route = combine_ordered_provinces(origin, observed_provinces, destination)
+        if len(observed_route) > len(stops) and all(point in observed_route for point in waypoints):
+            return observed_route
+
+    estimated_route = estimate_route_from_centroids(origin, destination, waypoints)
+    if len(estimated_route) > len(stops):
+        return estimated_route
+
+    backbone: list[str] = []
+    for leg_origin, leg_destination in zip(stops, stops[1:]):
+        inferred_leg = infer_route_provinces_with_llm(
+            leg_origin,
+            leg_destination,
+            [],
+            include_waypoints=False,
+            force_include_waypoints=False,
+        )
+        backbone = combine_ordered_provinces(backbone, inferred_leg or [leg_origin, leg_destination])
+
     if not backbone:
-        backbone = combine_ordered_provinces(origin, waypoints, destination)
+        backbone = stops
 
     if not observed_provinces:
         return backbone
 
-    overlap = [province for province in observed_provinces if province in backbone]
-    if len(overlap) < max(1, len(backbone) // 3):
-        return backbone
+    observed_route = combine_ordered_provinces(origin, observed_provinces, destination)
+    overlap = [province for province in observed_route if province in backbone]
+    if len(observed_route) >= len(backbone) or len(overlap) >= max(2, len(backbone) // 2):
+        return observed_route
 
-    merged = list(backbone)
-    for province in observed_provinces:
-        if province not in merged and province not in {origin, destination}:
-            merged.insert(-1, province)
-    return merged
+    return backbone
 
 
-def get_route_provinces(origin: str, destination: str, waypoints: list[str] | None = None) -> tuple[list[str], float]:
-    waypoints = combine_ordered_provinces(waypoints or [])
+@lru_cache(maxsize=512)
+def get_route_leg_provinces(origin: str, destination: str) -> tuple[list[str], float]:
+    origin = normalize_province_name(origin) or origin
+    destination = normalize_province_name(destination) or destination
+    fallback = combine_ordered_provinces(origin, destination)
 
     orig_lat, orig_lng = geocode(origin)
     dest_lat, dest_lng = geocode(destination)
     if orig_lat is None or dest_lat is None:
-        return build_sensible_route(origin, destination, waypoints), 0
-
-    coords_str = f"{orig_lng},{orig_lat}"
-    for waypoint in waypoints:
-        wp_lat, wp_lng = geocode(waypoint)
-        if wp_lat is not None and wp_lng is not None:
-            coords_str += f";{wp_lng},{wp_lat}"
-    coords_str += f";{dest_lng},{dest_lat}"
+        return fallback, 0
 
     try:
         response = http.get(
-            f"{OSRM_URL}/{coords_str}",
+            f"{OSRM_URL}/{orig_lng},{orig_lat};{dest_lng},{dest_lat}",
             params={"overview": "full", "geometries": "geojson"},
             timeout=15,
         )
         data = response.json()
     except Exception:
-        return build_sensible_route(origin, destination, waypoints), 0
+        return fallback, 0
 
     if data.get("code") != "Ok":
-        return build_sensible_route(origin, destination, waypoints), 0
+        return fallback, 0
 
     coords = data["routes"][0]["geometry"]["coordinates"]
     distance_km = float(data["routes"][0]["distance"]) / 1000
 
-    step = max(1, len(coords) // 8)
+    sample_target = 14
+    step = max(1, len(coords) // sample_target)
     sample_coords = coords[::step]
-    found_provinces: list[str] = []
+    if coords and sample_coords[-1] != coords[-1]:
+        sample_coords.append(coords[-1])
 
+    found_provinces: list[str] = []
     for lng, lat in sample_coords:
         province = reverse_geocode_province(round(lat, 4), round(lng, 4))
         if province and province not in found_provinces:
             found_provinces.append(province)
 
-    route_result = build_sensible_route(origin, destination, waypoints, observed_provinces=found_provinces)
-    if len(route_result) < 3:
-        route_result = combine_ordered_provinces(origin, found_provinces, waypoints, destination)
+    return combine_ordered_provinces(origin, found_provinces, destination), distance_km
+
+
+def get_route_provinces(origin: str, destination: str, waypoints: list[str] | None = None) -> tuple[list[str], float]:
+    waypoints = combine_ordered_provinces(waypoints or [])
+    stops = combine_ordered_provinces(origin, waypoints, destination)
+
+    if len(stops) < 2:
+        return combine_ordered_provinces(origin, waypoints, destination), 0
+
+    observed_provinces: list[str] = []
+    distance_km = 0.0
+
+    for leg_origin, leg_destination in zip(stops, stops[1:]):
+        leg_route, leg_distance_km = get_route_leg_provinces(leg_origin, leg_destination)
+        observed_provinces = combine_ordered_provinces(observed_provinces, leg_route)
+        distance_km += leg_distance_km
+
+    route_result = build_sensible_route(origin, destination, waypoints, observed_provinces=observed_provinces)
+    if len(route_result) < max(3, len(waypoints) + 2):
+        route_result = combine_ordered_provinces(origin, observed_provinces, waypoints, destination)
 
     return route_result or combine_ordered_provinces(origin, waypoints, destination), distance_km
 
