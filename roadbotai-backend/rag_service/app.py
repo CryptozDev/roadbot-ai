@@ -899,9 +899,9 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def detour_metrics(origin: str, waypoint: str, destination: str) -> tuple[float | None, float | None, float | None]:
-    orig_lat, orig_lng = geocode(origin)
-    wp_lat, wp_lng = geocode(waypoint)
-    dest_lat, dest_lng = geocode(destination)
+    orig_lat, orig_lng = get_province_position(origin)
+    wp_lat, wp_lng = get_province_position(waypoint)
+    dest_lat, dest_lng = get_province_position(destination)
 
     if None in (orig_lat, orig_lng, wp_lat, wp_lng, dest_lat, dest_lng):
         return None, None, None
@@ -922,7 +922,10 @@ def filter_unreasonable_waypoints(
     if not waypoints:
         return ([], []) if return_removed else []
 
-    base_route = infer_route_provinces_with_llm(origin, destination, [], include_waypoints=False)
+    base_route = estimate_route_from_centroids(origin, destination, [])
+    if len(base_route) < 3:
+        base_route = infer_route_provinces_with_llm(origin, destination, [], include_waypoints=False)
+
     filtered: list[str] = []
     removed_messages: list[str] = []
     current_origin = origin
@@ -931,13 +934,15 @@ def filter_unreasonable_waypoints(
         keep = True
         reason = ""
         direct_km, via_km, extra_km = detour_metrics(current_origin, waypoint, destination)
-        route_with_waypoint = infer_route_provinces_with_llm(
-            current_origin,
-            destination,
-            [waypoint],
-            include_waypoints=True,
-            force_include_waypoints=False,
-        )
+        route_with_waypoint = estimate_route_from_centroids(current_origin, destination, [waypoint])
+        if len(route_with_waypoint) < 3:
+            route_with_waypoint = infer_route_provinces_with_llm(
+                current_origin,
+                destination,
+                [waypoint],
+                include_waypoints=True,
+                force_include_waypoints=False,
+            )
 
         route_signal_reliable = len(base_route) >= 3 and len(route_with_waypoint) >= 3
         route_misses_waypoint = (
@@ -1013,6 +1018,28 @@ def get_province_position(province: str) -> tuple[float | None, float | None]:
     if normalized in centroids:
         return centroids[normalized]
     return geocode(normalized)
+
+
+def estimate_distance_from_route(provinces: list[str] | None = None) -> float:
+    route = combine_ordered_provinces(provinces or [])
+    if len(route) < 2:
+        return 0.0
+
+    total_km = 0.0
+    segments = 0
+    for start, end in zip(route, route[1:]):
+        start_lat, start_lng = get_province_position(start)
+        end_lat, end_lng = get_province_position(end)
+        if None in (start_lat, start_lng, end_lat, end_lng):
+            continue
+        total_km += haversine_km(start_lat, start_lng, end_lat, end_lng)
+        segments += 1
+
+    if segments == 0:
+        return 0.0
+
+    road_factor = 1.12 if segments >= 3 else 1.18
+    return total_km * road_factor
 
 
 def estimate_leg_provinces_from_centroids(origin: str, destination: str) -> list[str]:
@@ -1149,41 +1176,30 @@ def get_route_leg_provinces(origin: str, destination: str) -> tuple[list[str], f
     origin = normalize_province_name(origin) or origin
     destination = normalize_province_name(destination) or destination
     fallback = combine_ordered_provinces(origin, destination)
+    estimated_route = estimate_leg_provinces_from_centroids(origin, destination)
+    estimated_distance_km = estimate_distance_from_route(estimated_route or fallback)
 
-    orig_lat, orig_lng = geocode(origin)
-    dest_lat, dest_lng = geocode(destination)
+    orig_lat, orig_lng = get_province_position(origin)
+    dest_lat, dest_lng = get_province_position(destination)
     if orig_lat is None or dest_lat is None:
-        return fallback, 0
+        return estimated_route or fallback, estimated_distance_km
 
     try:
         response = http.get(
             f"{OSRM_URL}/{orig_lng},{orig_lat};{dest_lng},{dest_lat}",
-            params={"overview": "full", "geometries": "geojson"},
-            timeout=15,
+            params={"overview": "false"},
+            timeout=3,
         )
         data = response.json()
     except Exception:
-        return fallback, 0
+        return estimated_route or fallback, estimated_distance_km
 
     if data.get("code") != "Ok":
-        return fallback, 0
+        return estimated_route or fallback, estimated_distance_km
 
-    coords = data["routes"][0]["geometry"]["coordinates"]
-    distance_km = float(data["routes"][0]["distance"]) / 1000
-
-    sample_target = 14
-    step = max(1, len(coords) // sample_target)
-    sample_coords = coords[::step]
-    if coords and sample_coords[-1] != coords[-1]:
-        sample_coords.append(coords[-1])
-
-    found_provinces: list[str] = []
-    for lng, lat in sample_coords:
-        province = reverse_geocode_province(round(lat, 4), round(lng, 4))
-        if province and province not in found_provinces:
-            found_provinces.append(province)
-
-    return combine_ordered_provinces(origin, found_provinces, destination), distance_km
+    distance_km = float(data["routes"][0].get("distance") or 0) / 1000
+    resolved_route = estimated_route or fallback
+    return resolved_route, distance_km or estimated_distance_km
 
 
 def get_route_provinces(origin: str, destination: str, waypoints: list[str] | None = None) -> tuple[list[str], float]:
@@ -1342,35 +1358,6 @@ def ask_roadbot(question: str, top_k: int, embedding_model: str) -> tuple[str, l
             [],
         )
 
-    refs = retrieve_refs(question, max(top_k, 10), embedding_model)
-
-    if q_type == "top_provinces":
-        df = _state.get("df")
-        if isinstance(df, pd.DataFrame) and not df.empty and "province" in df.columns:
-            top_provinces_df = df["province"].value_counts().reset_index().head(5)
-            top_provinces_df.columns = ["province", "accident_count"]
-            top_provinces_df = top_provinces_df[top_provinces_df["province"] != "ไม่ระบุ"]
-            top_str = ", ".join(
-                [
-                    f"{row['province']} ({int(row['accident_count']):,} ครั้ง)"
-                    for _, row in top_provinces_df.iterrows()
-                ]
-            )
-            fallback = f"จังหวัดที่พบอุบัติเหตุสูงสุด: {top_str}" if top_str else "ไม่มีข้อมูลเพียงพอ"
-            return answer_with_llm(question, top_str, fallback), refs
-
-    if q_type == "top_causes":
-        df = _state.get("df")
-        if isinstance(df, pd.DataFrame) and not df.empty and "cause" in df.columns:
-            top_causes_df = df["cause"].value_counts().reset_index().head(5)
-            top_causes_df.columns = ["cause", "accident_count"]
-            top_causes_df = top_causes_df[top_causes_df["cause"] != "ไม่ระบุ"]
-            top_str = ", ".join(
-                [f"{row['cause']} ({int(row['accident_count']):,} ครั้ง)" for _, row in top_causes_df.iterrows()]
-            )
-            fallback = f"สาเหตุอุบัติเหตุที่พบบ่อย: {top_str}" if top_str else "ไม่มีข้อมูลเพียงพอ"
-            return answer_with_llm(question, top_str, fallback), refs
-
     if q_type == "route_analysis":
         origin, destination, waypoints = extract_origin_destination(question)
         if origin and destination:
@@ -1400,6 +1387,38 @@ def ask_roadbot(question: str, top_k: int, embedding_model: str) -> tuple[str, l
             for province in provinces:
                 docs.extend(fetch_docs_for_province(province, limit=6))
             return answer, docs[:40]
+
+    refs: list[dict[str, Any]] = []
+
+    if q_type in {"top_provinces", "top_causes", "other_accident_stats"}:
+        refs = retrieve_refs(question, max(top_k, 10), embedding_model)
+
+    if q_type == "top_provinces":
+        df = _state.get("df")
+        if isinstance(df, pd.DataFrame) and not df.empty and "province" in df.columns:
+            top_provinces_df = df["province"].value_counts().reset_index().head(5)
+            top_provinces_df.columns = ["province", "accident_count"]
+            top_provinces_df = top_provinces_df[top_provinces_df["province"] != "ไม่ระบุ"]
+            top_str = ", ".join(
+                [
+                    f"{row['province']} ({int(row['accident_count']):,} ครั้ง)"
+                    for _, row in top_provinces_df.iterrows()
+                ]
+            )
+            fallback = f"จังหวัดที่พบอุบัติเหตุสูงสุด: {top_str}" if top_str else "ไม่มีข้อมูลเพียงพอ"
+            return answer_with_llm(question, top_str, fallback), refs
+
+    if q_type == "top_causes":
+        df = _state.get("df")
+        if isinstance(df, pd.DataFrame) and not df.empty and "cause" in df.columns:
+            top_causes_df = df["cause"].value_counts().reset_index().head(5)
+            top_causes_df.columns = ["cause", "accident_count"]
+            top_causes_df = top_causes_df[top_causes_df["cause"] != "ไม่ระบุ"]
+            top_str = ", ".join(
+                [f"{row['cause']} ({int(row['accident_count']):,} ครั้ง)" for _, row in top_causes_df.iterrows()]
+            )
+            fallback = f"สาเหตุอุบัติเหตุที่พบบ่อย: {top_str}" if top_str else "ไม่มีข้อมูลเพียงพอ"
+            return answer_with_llm(question, top_str, fallback), refs
 
     if q_type == "province_details":
         provinces = extract_provinces_from_text(question)
