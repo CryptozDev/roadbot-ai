@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 from functools import lru_cache
 from math import atan2, cos, radians, sin, sqrt
 from typing import Any
@@ -14,6 +15,8 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
+from openai import OpenAI
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
@@ -157,8 +160,50 @@ PROVINCE_ALIASES = {
     "กรุงเทพมหานคร": "กรุงเทพ",
 }
 
+PLACE_ALIASES = {
+    "พระราม2": "ถนนพระราม 2, กรุงเทพมหานคร, Thailand",
+    "พระราม 2": "ถนนพระราม 2, กรุงเทพมหานคร, Thailand",
+    "บางแสน": "บางแสน ชลบุรี, Thailand",
+    "พัทยา": "พัทยา ชลบุรี, Thailand",
+    "พัทยาเหนือ": "พัทยาเหนือ ชลบุรี, Thailand",
+    "พัทยากลาง": "พัทยากลาง ชลบุรี, Thailand",
+    "พัทยาใต้": "พัทยาใต้ ชลบุรี, Thailand",
+    "แหลมฉบัง": "แหลมฉบัง ชลบุรี, Thailand",
+    "มอเตอร์เวย์": "ทางหลวงพิเศษหมายเลข 7 Thailand",
+    "บางนา": "บางนา กรุงเทพมหานคร, Thailand",
+    "บางปะอิน": "บางปะอิน พระนครศรีอยุธยา, Thailand",
+    "โคราช": "นครราชสีมา Thailand",
+    "หาดใหญ่": "หาดใหญ่ สงขลา, Thailand",
+}
+
+PLACE_PROVINCE_HINTS = {
+    "พระราม2": "กรุงเทพ",
+    "พระราม 2": "กรุงเทพ",
+    "บางนา": "กรุงเทพ",
+    "บางแสน": "ชลบุรี",
+    "พัทยา": "ชลบุรี",
+    "พัทยาเหนือ": "ชลบุรี",
+    "พัทยากลาง": "ชลบุรี",
+    "พัทยาใต้": "ชลบุรี",
+    "แหลมฉบัง": "ชลบุรี",
+    "บางปะอิน": "พระนครศรีอยุธยา",
+    "โคราช": "นครราชสีมา",
+    "หาดใหญ่": "สงขลา",
+}
+
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
+LONGDO_EVENT_URL = os.getenv("LONGDO_EVENT_URL", "https://event.longdo.com/feed/json")
+OPEN_METEO_URL = os.getenv("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
+EXAT_API_BASE_URL = os.getenv("EXAT_API_BASE_URL", "https://exat-man.web.app/api")
+OPENAI_WEB_SEARCH_ENABLED = os.getenv("OPENAI_WEB_SEARCH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+OPENAI_WEB_MODEL = os.getenv("OPENAI_WEB_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+HERE_API_KEY = os.getenv("HERE_API_KEY", "").strip()
+HERE_TRAFFIC_URL = os.getenv("HERE_TRAFFIC_URL", "https://data.traffic.hereapi.com/v7/incidents")
+TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY", "").strip()
+TOMTOM_TRAFFIC_URL = os.getenv("TOMTOM_TRAFFIC_URL", "https://api.tomtom.com/traffic/services/5/incidentDetails")
+EXAT_LOOKBACK_MONTHS = max(1, int(os.getenv("EXAT_LOOKBACK_MONTHS", "3")))
+REALTIME_ROUTE_RADIUS_KM = float(os.getenv("REALTIME_ROUTE_RADIUS_KM", "12"))
 
 http = requests.Session()
 http.headers.update({"User-Agent": "RoadbotAI/3.0"})
@@ -174,12 +219,24 @@ _warmup_state = {
     "updated_at": 0,
 }
 
+_realtime_cache: dict[str, Any] = {
+    "fetched_at": 0.0,
+    "events": [],
+}
+
+_weather_cache: dict[str, Any] = {
+    "fetched_at": 0.0,
+    "items": {},
+}
+
 _state: dict[str, Any] = {
     "rows": [],
     "texts": [],
     "df": pd.DataFrame(),
     "weather_summary": {},
     "llm": None,
+    "llm_provider": "none",
+    "openai_client": None,
     "index": None,
     "index_path": "",
     "meta_path": "",
@@ -227,32 +284,143 @@ def get_embedder(model_name: str) -> SentenceTransformer:
     return _embedder_cache[model_name]
 
 
-def get_llm() -> ChatGroq | None:
-    if _state.get("llm") is not None:
+def build_openai_llm(temperature: float) -> Any | None:
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not openai_key:
+        return None
+    openai_model = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    return ChatOpenAI(model=openai_model, temperature=temperature, api_key=openai_key)
+
+
+def build_groq_llm(temperature: float) -> Any | None:
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not groq_key:
+        return None
+    groq_model = os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
+    return ChatGroq(model=groq_model, temperature=temperature, api_key=groq_key)
+
+
+def get_llm(preferred_provider: str | None = None) -> Any | None:
+    if _state.get("llm") is not None and (preferred_provider in (None, _state.get("llm_provider"))):
         return _state["llm"]
 
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
-        _state["llm"] = None
-        return None
+    temperature = float(os.getenv("LLM_TEMPERATURE", os.getenv("GROQ_TEMPERATURE", "0.1")))
+    provider_order = [preferred_provider] if preferred_provider else []
+    provider_order.extend(["openai", "groq"])
 
-    model = os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
-    temperature = float(os.getenv("GROQ_TEMPERATURE", "0.1"))
+    tried: set[str] = set()
+    for provider in provider_order:
+        if not provider or provider in tried:
+            continue
+        tried.add(provider)
+        try:
+            llm = build_openai_llm(temperature) if provider == "openai" else build_groq_llm(temperature)
+            if llm is not None:
+                _state["llm"] = llm
+                _state["llm_provider"] = provider
+                return llm
+        except Exception:
+            continue
 
-    try:
-        _state["llm"] = ChatGroq(model=model, temperature=temperature, api_key=api_key)
-    except Exception:
-        _state["llm"] = None
-    return _state["llm"]
+    _state["llm"] = None
+    _state["llm_provider"] = "none"
+    return None
 
 
 def llm_invoke(prompt: str) -> str:
-    llm = get_llm()
-    if llm is None:
-        return ""
+    providers = [_state.get("llm_provider"), "openai", "groq"]
+    tried: set[str] = set()
+
+    for provider in providers:
+        provider = provider or None
+        if provider in tried:
+            continue
+        tried.add(provider)
+
+        llm = get_llm(provider)
+        if llm is None:
+            continue
+
+        try:
+            return str(llm.invoke(prompt).content or "").strip()
+        except Exception:
+            _state["llm"] = None
+            if provider:
+                _state["llm_provider"] = "none"
+            continue
+
+    return ""
+
+
+def get_openai_client() -> OpenAI | None:
+    if _state.get("openai_client") is not None:
+        return _state["openai_client"]
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
 
     try:
-        return str(llm.invoke(prompt).content or "").strip()
+        client = OpenAI(api_key=api_key)
+        _state["openai_client"] = client
+        return client
+    except Exception:
+        _state["openai_client"] = None
+        return None
+
+
+def fetch_openai_web_realtime_summary(
+    question: str,
+    route_title: str,
+    provinces: list[str],
+    nearby_events: list[dict[str, Any]],
+    current_weather: list[dict[str, Any]],
+) -> str:
+    if not OPENAI_WEB_SEARCH_ENABLED:
+        return ""
+
+    client = get_openai_client()
+    if client is None:
+        return ""
+
+    event_context = "\n".join(
+        [
+            f"- [{event.get('source', 'source')}] {event.get('title', '')} | {event.get('description', '')} | {event.get('start', '')}"
+            for event in nearby_events[:4]
+        ]
+    ) or "- ไม่มีเหตุการณ์สดจาก feed ภายในระบบ"
+
+    weather_context = "\n".join(
+        [
+            f"- {item.get('label', '-')}: {item.get('condition', '-')}, {item.get('temperature_c', '-')}°C, ฝน {item.get('rain_mm', 0)} มม."
+            for item in current_weather[:3]
+        ]
+    ) or "- ไม่มีข้อมูลอากาศล่าสุด"
+
+    prompt = (
+        "ค้นข้อมูลเว็บสาธารณะล่าสุดที่เกี่ยวข้องกับการจราจรหรืออุบัติเหตุในประเทศไทยสำหรับเส้นทางนี้ และสรุปแบบสั้น กระชับ เป็นภาษาไทย\n"
+        "หากไม่พบข้อมูลใหม่ที่น่าเชื่อถือ ให้บอกว่าไม่พบข้อมูลเว็บเพิ่มเติม\n"
+        "ห้ามแต่งข้อมูล และให้เน้นเฉพาะข้อมูลสดหรืออัปเดตล่าสุดเกี่ยวกับการเดินทาง\n\n"
+        f"คำถามผู้ใช้: {question}\n"
+        f"เส้นทาง: {route_title}\n"
+        f"จังหวัดตามแนวเส้นทาง: {' -> '.join(provinces) if provinces else '-'}\n\n"
+        f"ข้อมูลสดที่ระบบมีอยู่แล้ว:\n{event_context}\n\n"
+        f"สภาพอากาศล่าสุด:\n{weather_context}\n"
+    )
+
+    try:
+        response = client.responses.create(
+            model=OPENAI_WEB_MODEL,
+            tools=[
+                {
+                    "type": "web_search_preview",
+                    "user_location": {"type": "approximate", "country": "TH"},
+                }
+            ],
+            input=prompt,
+        )
+        text = str(getattr(response, "output_text", "") or "").strip()
+        return text
     except Exception:
         return ""
 
@@ -612,14 +780,150 @@ def extract_origin_destination(question: str) -> tuple[str | None, str | None, l
     return None, None, []
 
 
+def is_known_province(value: str | None) -> bool:
+    normalized = normalize_province_name(value)
+    return bool(normalized and normalized in THAI_PROVINCES)
+
+
+def clean_place_label(text: str | None) -> str:
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"[`\"'“”‘’]+", "", cleaned)
+    cleaned = re.split(
+        r"(?:ตอนนี้|ล่าสุด|เรียลไทม์|สด|คืนนี้|พรุ่งนี้|วันนี้|เช้านี้|เย็นนี้|ช่วงนี้|ดึกนี้|จุดเสี่ยง|อุบัติเหตุ|รถติด|ต้องระวัง|ควรระวัง|ควรเลี่ยง|เส้นทางไหนบ้าง|เส้นทางไหน|จากข้อมูล|ข้อมูลสด|ข้อมูลย้อนหลัง|มีอะไร|มี|ไหม|มั้ย|หรือไม่|ผ่าน|แวะ|via)",
+        cleaned,
+        maxsplit=1,
+    )[0]
+    cleaned = re.split(r"\s+(?:จาก|ไป|ถึง)\s+", cleaned, maxsplit=1)[0]
+    cleaned = cleaned.strip(" ,-/|>~")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned
+
+
+def resolve_place_to_province(place_name: str | None) -> str | None:
+    label = clean_place_label(place_name)
+    if not label:
+        return None
+
+    hinted = PLACE_PROVINCE_HINTS.get(label)
+    if hinted:
+        return hinted
+
+    found = extract_provinces_from_text(label)
+    if found:
+        return found[0]
+
+    normalized = normalize_province_name(label)
+    if normalized in THAI_PROVINCES:
+        return normalized
+
+    lat, lng = geocode(label)
+    if lat is not None and lng is not None:
+        province = reverse_geocode_province(lat, lng)
+        if province:
+            return province
+
+    return normalized if normalized in THAI_PROVINCES else None
+
+
+def extract_route_labels(question: str) -> tuple[str | None, str | None, list[str]]:
+    text = str(question or "").strip()
+    if not text:
+        return None, None, []
+
+    origin_match = re.search(
+        r"จาก\s*([ก-๙A-Za-z0-9\.\-/\s]+?)(?=$|ผ่าน|แวะ|via|ไป|ถึง|คืนนี้|พรุ่งนี้|วันนี้|เช้านี้|เย็นนี้|ช่วงนี้|จุดเสี่ยง|อุบัติเหตุ|รถติด|ไหม|มั้ย|ล่าสุด|ตอนนี้|มี|ต้อง|ควร|ระวัง)",
+        text,
+    )
+    destination_match = re.search(
+        r"(?:ไป|ถึง)\s*([ก-๙A-Za-z0-9\.\-/\s]+?)(?=$|จาก|ผ่าน|แวะ|via|คืนนี้|พรุ่งนี้|วันนี้|เช้านี้|เย็นนี้|ช่วงนี้|จุดเสี่ยง|อุบัติเหตุ|รถติด|ไหม|มั้ย|ล่าสุด|ตอนนี้|มี|ต้อง|ควร|ระวัง)",
+        text,
+    )
+    waypoint_matches = re.findall(
+        r"(?:ผ่าน|แวะ|via)\s*([ก-๙A-Za-z0-9\.\-/\s]+?)(?=$|จาก|ผ่าน|แวะ|via|ไป|ถึง|คืนนี้|พรุ่งนี้|วันนี้|เช้านี้|เย็นนี้|ช่วงนี้|จุดเสี่ยง|อุบัติเหตุ|รถติด|ไหม|มั้ย|ล่าสุด|ตอนนี้|มี|ต้อง|ควร|ระวัง)",
+        text,
+    )
+
+    origin_label = clean_place_label(origin_match.group(1)) if origin_match else None
+    destination_label = clean_place_label(destination_match.group(1)) if destination_match else None
+    waypoint_labels = [clean_place_label(item) for item in waypoint_matches if clean_place_label(item)]
+
+    named_candidates = [label for label in sorted(PLACE_ALIASES.keys(), key=len, reverse=True) if label in text]
+    province_candidates = extract_provinces_from_text(text)
+    combined_candidates: list[str] = []
+    for item in named_candidates + province_candidates:
+        cleaned = clean_place_label(item)
+        if cleaned and cleaned not in combined_candidates:
+            combined_candidates.append(cleaned)
+
+    if len(combined_candidates) >= 2:
+        reversed_route_order = text.startswith("ไป") and "จาก" in text and text.find("ไป") < text.find("จาก")
+        if not origin_label:
+            origin_label = combined_candidates[-1] if reversed_route_order else combined_candidates[0]
+        if not destination_label:
+            destination_label = combined_candidates[0] if reversed_route_order else combined_candidates[-1]
+    if not waypoint_labels and len(combined_candidates) >= 3:
+        waypoint_labels = combined_candidates[1:-1]
+
+    waypoint_labels = [item for item in waypoint_labels if item and item not in {origin_label, destination_label}]
+    return origin_label, destination_label, waypoint_labels
+
+
+def build_route_context(question: str) -> dict[str, Any]:
+    origin_label, destination_label, waypoint_labels = extract_route_labels(question)
+    fallback_origin, fallback_destination, fallback_waypoints = extract_origin_destination(question)
+
+    if not origin_label and fallback_origin:
+        origin_label = clean_place_label(fallback_origin)
+    if not destination_label and fallback_destination:
+        destination_label = clean_place_label(fallback_destination)
+    if not waypoint_labels and fallback_waypoints:
+        waypoint_labels = [clean_place_label(item) for item in fallback_waypoints if clean_place_label(item)]
+
+    place_labels: list[str] = []
+    for item in [origin_label, *waypoint_labels, destination_label]:
+        cleaned = clean_place_label(item)
+        if cleaned and cleaned not in place_labels:
+            place_labels.append(cleaned)
+
+    origin = resolve_place_to_province(origin_label or fallback_origin)
+    destination = resolve_place_to_province(destination_label or fallback_destination)
+
+    waypoint_provinces: list[str] = []
+    for item in waypoint_labels or fallback_waypoints:
+        province = resolve_place_to_province(item)
+        if province and province not in waypoint_provinces and province not in {origin, destination}:
+            waypoint_provinces.append(province)
+
+    return {
+        "origin": origin,
+        "destination": destination,
+        "waypoints": waypoint_provinces,
+        "origin_label": origin_label or origin,
+        "destination_label": destination_label or destination,
+        "waypoint_labels": waypoint_labels,
+        "place_labels": place_labels,
+    }
+
+
 def classify_question(question: str) -> str:
     question = str(question or "").strip()
     found_provinces = extract_provinces_from_text(question)
+    origin_label, destination_label, waypoint_labels = extract_route_labels(question)
+    has_route_markers = any(word in question for word in ["ไป", "จาก", "ผ่าน", "เส้นทาง", "จุดเสี่ยง", "ระวัง", "ขับ", "แวะ", "via"])
+    has_route_context = bool(origin_label and destination_label) or bool(destination_label and waypoint_labels)
 
     if any(hint in question for hint in IRRELEVANT_HINTS):
         return "irrelevant"
 
-    if any(word in question for word in ["ตอนนี้", "ล่าสุด", "เรียลไทม์", "สด"]):
+    has_realtime_signal = any(word in question for word in ["ตอนนี้", "ล่าสุด", "เรียลไทม์", "สด", "คืนนี้", "วันนี้", "พรุ่งนี้", "ช่วงนี้", "live", "now"])
+
+    if has_realtime_signal and (has_route_context or len(found_provinces) >= 1):
+        return "realtime"
+
+    if has_route_markers and (has_route_context or len(found_provinces) >= 2):
+        return "route_analysis"
+
+    if has_realtime_signal:
         return "realtime"
 
     if any(
@@ -630,11 +934,6 @@ def classify_question(question: str) -> str:
 
     if any(word in question for word in ["สาเหตุ", "ต้นเหตุ", "เกิดจากอะไร"]):
         return "top_causes"
-
-    if len(found_provinces) >= 2 and any(
-        word in question for word in ["ไป", "จาก", "ผ่าน", "เส้นทาง", "จุดเสี่ยง", "ระวัง", "ขับ"]
-    ):
-        return "route_analysis"
 
     if found_provinces and any(word in question for word in ["อุบัติเหตุ", "จุดเสี่ยง", "จังหวัด", "สภาพอากาศ", "ระวัง"]):
         return "province_details"
@@ -861,12 +1160,13 @@ def infer_route_provinces_with_llm(
 
 @lru_cache(maxsize=256)
 def geocode(place_name: str) -> tuple[float | None, float | None]:
+    place_name = clean_place_label(place_name)
+    if not place_name:
+        return None, None
+
+    alias_query = PLACE_ALIASES.get(place_name)
     normalized = normalize_province_name(place_name) or place_name
-    queries = [
-        f"{normalized}, Thailand",
-        f"จังหวัด{normalized}, Thailand",
-        str(place_name),
-    ]
+    queries = [query for query in [alias_query, f"{normalized}, Thailand", f"จังหวัด{normalized}, Thailand", str(place_name)] if query]
 
     for query in queries:
         try:
@@ -1278,12 +1578,18 @@ def format_route_answer(
     risk_points: list[dict[str, Any]],
     weather_info: str,
     removed_waypoint_notes: list[str] | None = None,
+    origin_label: str | None = None,
+    destination_label: str | None = None,
+    waypoint_labels: list[str] | None = None,
 ) -> str:
     lines: list[str] = []
     distance_text = f"ประมาณ {dist_km:.0f} กม." if dist_km > 0 else "ไม่สามารถประเมินระยะทางได้"
 
-    lines.append(f"เส้นทาง: {origin} -> {destination} ({distance_text})")
-    lines.append(f"จังหวัดที่ผ่าน: {' -> '.join(provinces) if provinces else '-'}")
+    display_parts = [item for item in [origin_label or origin, *(waypoint_labels or []), destination_label or destination] if item]
+    display_route = " -> ".join(display_parts) if display_parts else f"{origin} -> {destination}"
+
+    lines.append(f"เส้นทาง: {display_route} ({distance_text})")
+    lines.append(f"จังหวัดตามแนวเส้นทาง: {' -> '.join(provinces) if provinces else '-'}")
 
     if removed_waypoint_notes:
         lines.append("")
@@ -1315,6 +1621,751 @@ def format_route_answer(
     lines.append("- ชะลอความเร็วเมื่อเข้าใกล้ทางโค้ง ทางแยก และจุดกลับรถ")
     lines.append("- สังเกตป้ายเตือนและเตรียมเปลี่ยนเลนล่วงหน้าก่อนถึงจุดเสี่ยง")
     lines.append("- หากฝนตกหรือทัศนวิสัยไม่ดี ให้เพิ่มระยะห่างจากรถคันหน้า")
+    return "\n".join(lines)
+
+
+def is_value_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() not in {"", "none", "null", "nan", "ไม่ระบุ"}
+    if isinstance(value, (list, dict, tuple, set)):
+        return len(value) > 0
+    return True
+
+
+def first_present(*values: Any) -> Any:
+    for value in values:
+        if is_value_present(value):
+            return value
+    return None
+
+
+def safe_float(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def deep_find_value(payload: Any, candidate_keys: set[str]) -> Any:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if str(key).lower() in candidate_keys and is_value_present(value):
+                return value
+        for value in payload.values():
+            result = deep_find_value(value, candidate_keys)
+            if is_value_present(result):
+                return result
+    elif isinstance(payload, list):
+        for item in payload:
+            result = deep_find_value(item, candidate_keys)
+            if is_value_present(result):
+                return result
+    return None
+
+
+def extract_event_coordinates(payload: Any) -> tuple[float | None, float | None]:
+    lat = safe_float(deep_find_value(payload, {"latitude", "lat", "y"}))
+    lng = safe_float(deep_find_value(payload, {"longitude", "lng", "lon", "x"}))
+    if lat is not None and lng is not None:
+        return lat, lng
+
+    geometry = deep_find_value(payload, {"geometry", "shape"})
+    if isinstance(geometry, dict):
+        coordinates = geometry.get("coordinates")
+        if isinstance(coordinates, list) and coordinates:
+            first = coordinates[0]
+            if isinstance(first, (list, tuple)) and len(first) >= 2:
+                return safe_float(first[1]), safe_float(first[0])
+            if isinstance(first, dict):
+                lat = safe_float(first.get("lat"))
+                lng = safe_float(first.get("lng") or first.get("lon"))
+                if lat is not None and lng is not None:
+                    return lat, lng
+
+        links = geometry.get("links")
+        if isinstance(links, list) and links:
+            points = links[0].get("points") or []
+            if points and isinstance(points[0], dict):
+                lat = safe_float(points[0].get("lat"))
+                lng = safe_float(points[0].get("lng"))
+                if lat is not None and lng is not None:
+                    return lat, lng
+
+    return None, None
+
+
+def parse_event_time(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).isoformat(sep=" ", timespec="seconds")
+    except Exception:
+        return text
+
+
+def get_route_points(provinces: list[str], labels: list[str] | None = None) -> list[tuple[str, float, float]]:
+    points: list[tuple[str, float, float]] = []
+
+    for label in labels or []:
+        lat, lng = geocode(label)
+        if lat is not None and lng is not None:
+            points.append((label, float(lat), float(lng)))
+
+    for province in provinces:
+        lat, lng = get_province_position(province)
+        if lat is not None and lng is not None and province not in [item[0] for item in points]:
+            points.append((province, float(lat), float(lng)))
+
+    deduped: list[tuple[str, float, float]] = []
+    seen_labels: set[str] = set()
+    for label, lat, lng in points:
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        deduped.append((label, lat, lng))
+    return deduped
+
+
+def build_route_bbox(route_points: list[tuple[str, float, float]], padding_deg: float = 0.12) -> str | None:
+    if not route_points:
+        return None
+    lats = [lat for _, lat, _ in route_points]
+    lngs = [lng for _, _, lng in route_points]
+    min_lat = min(lats) - padding_deg
+    max_lat = max(lats) + padding_deg
+    min_lng = min(lngs) - padding_deg
+    max_lng = max(lngs) + padding_deg
+    return f"{min_lng},{min_lat},{max_lng},{max_lat}"
+
+
+def fetch_realtime_events(max_age_seconds: int = 600) -> list[dict[str, Any]]:
+    now = time.time()
+    cached_age = now - float(_realtime_cache.get("fetched_at") or 0)
+    if _realtime_cache.get("events") and cached_age <= max_age_seconds:
+        return list(_realtime_cache["events"])
+
+    try:
+        response = http.get(LONGDO_EVENT_URL, timeout=8)
+        response.raise_for_status()
+        data = response.json()
+        events = data if isinstance(data, list) else []
+        normalized_events: list[dict[str, Any]] = []
+        for item in events:
+            try:
+                normalized_events.append(
+                    {
+                        "source": "Longdo/iTIC",
+                        "source_id": str(item.get("eid") or item.get("id") or ""),
+                        "title": str(item.get("title") or item.get("title_en") or "เหตุจราจร"),
+                        "description": str(item.get("description") or item.get("description_en") or "").strip(),
+                        "lat": float(item.get("latitude")) if item.get("latitude") not in (None, "") else None,
+                        "lng": float(item.get("longitude")) if item.get("longitude") not in (None, "") else None,
+                        "start": parse_event_time(item.get("start")),
+                        "severity": str(item.get("severity") or ""),
+                        "icon": str(item.get("icon") or ""),
+                    }
+                )
+            except Exception:
+                continue
+        _realtime_cache["fetched_at"] = now
+        _realtime_cache["events"] = normalized_events
+        return normalized_events
+    except Exception:
+        return list(_realtime_cache.get("events") or [])
+
+
+def fetch_exat_events_for_route(route_points: list[tuple[str, float, float]]) -> list[dict[str, Any]]:
+    if not EXAT_API_BASE_URL:
+        return []
+
+    events: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    year = datetime.now().year
+    month = datetime.now().month
+
+    for _ in range(EXAT_LOOKBACK_MONTHS):
+        for endpoint in ["EXAT_Accident", "EXAT_Crash"]:
+            url = f"{EXAT_API_BASE_URL.rstrip('/')}/{endpoint}/{year}/{month}"
+            try:
+                response = http.get(url, timeout=8)
+                response.raise_for_status()
+                payload = response.json()
+            except Exception:
+                continue
+
+            for item in payload.get("result") or []:
+                lat, lng = extract_event_coordinates(item)
+                title = first_present(
+                    deep_find_value(item, {"title", "event_name", "accident_type", "crash_type", "type"}),
+                    endpoint.replace("EXAT_", "EXAT "),
+                )
+                road_name = first_present(deep_find_value(item, {"road", "road_name", "route", "expressway", "location"}), "")
+                description = first_present(
+                    deep_find_value(item, {"description", "detail", "remark", "cause", "location"}),
+                    road_name,
+                    title,
+                )
+                start = parse_event_time(first_present(deep_find_value(item, {"date", "datetime", "start_time", "created_at"}), f"{year}-{month:02d}-01"))
+                source_id = str(first_present(deep_find_value(item, {"id", "accident_id", "crash_id"}), f"{endpoint}-{year}-{month}-{len(events)}"))
+                if source_id in seen:
+                    continue
+                seen.add(source_id)
+                events.append(
+                    {
+                        "source": "EXAT",
+                        "source_id": source_id,
+                        "title": str(title or "เหตุบนทางพิเศษ"),
+                        "description": str(description or road_name or "ข้อมูลอุบัติเหตุจาก EXAT"),
+                        "lat": lat,
+                        "lng": lng,
+                        "start": start,
+                        "severity": "",
+                        "icon": endpoint.lower(),
+                    }
+                )
+
+        month -= 1
+        if month <= 0:
+            month = 12
+            year -= 1
+
+    return events[:20]
+
+
+def fetch_here_events_for_route(route_points: list[tuple[str, float, float]]) -> list[dict[str, Any]]:
+    if not HERE_API_KEY or not route_points:
+        return []
+
+    query_points = route_points if len(route_points) <= 3 else [route_points[0], route_points[len(route_points) // 2], route_points[-1]]
+    events: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    radius_m = max(8000, int(REALTIME_ROUTE_RADIUS_KM * 1000))
+
+    for _, lat, lng in query_points:
+        try:
+            response = http.get(
+                HERE_TRAFFIC_URL,
+                params={
+                    "in": f"circle:{lat},{lng};r={radius_m}",
+                    "locationReferencing": "none",
+                    "lang": "th-TH",
+                    "apiKey": HERE_API_KEY,
+                },
+                timeout=8,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            continue
+
+        for item in payload.get("results") or []:
+            details = item.get("incidentDetails") or item
+            source_id = str(first_present(details.get("id"), item.get("id"), f"here-{len(events)}"))
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+
+            lat_value, lng_value = extract_event_coordinates(item)
+            description = first_present(
+                (details.get("description") or {}).get("value") if isinstance(details.get("description"), dict) else details.get("description"),
+                (details.get("summary") or {}).get("value") if isinstance(details.get("summary"), dict) else details.get("summary"),
+                deep_find_value(details.get("events") or details, {"description"}),
+            )
+            title = first_present(details.get("type"), details.get("criticality"), "HERE incident")
+            road_from = first_present(details.get("from"), deep_find_value(details, {"roadname", "roadnumbers"}), "")
+            if road_from and description:
+                description = f"{description} | {road_from}"
+
+            events.append(
+                {
+                    "source": "HERE",
+                    "source_id": source_id,
+                    "title": str(title or "HERE incident"),
+                    "description": str(description or "ข้อมูลเหตุจราจรจาก HERE"),
+                    "lat": lat_value,
+                    "lng": lng_value,
+                    "start": parse_event_time(first_present(details.get("startTime"), details.get("lastReportTime"))),
+                    "severity": str(first_present(details.get("criticality"), details.get("severity"), "")),
+                    "icon": str(first_present(details.get("type"), "here")),
+                }
+            )
+
+    return events[:20]
+
+
+def fetch_tomtom_events_for_route(route_points: list[tuple[str, float, float]]) -> list[dict[str, Any]]:
+    if not TOMTOM_API_KEY or not route_points:
+        return []
+
+    bbox = build_route_bbox(route_points)
+    if not bbox:
+        return []
+
+    try:
+        response = http.get(
+            TOMTOM_TRAFFIC_URL,
+            params={
+                "key": TOMTOM_API_KEY,
+                "bbox": bbox,
+                "fields": "{incidents{type,geometry{type,coordinates},properties{id,iconCategory,magnitudeOfDelay,events{description,code,iconCategory},startTime,endTime,from,to,roadNumbers,length,delay,timeValidity}}}",
+                "language": "th-TH",
+                "timeValidityFilter": "present",
+            },
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return []
+
+    events: list[dict[str, Any]] = []
+    for item in payload.get("incidents") or []:
+        props = item.get("properties") or {}
+        event_list = props.get("events") or []
+        first_event = event_list[0] if event_list else {}
+        lat, lng = extract_event_coordinates(item)
+        description = first_present(first_event.get("description"), props.get("from"), props.get("to"), "ข้อมูลเหตุจราจรจาก TomTom")
+        road_numbers = props.get("roadNumbers") or []
+        road_text = ", ".join(road_numbers) if isinstance(road_numbers, list) else str(road_numbers or "")
+        if road_text and description:
+            description = f"{description} | ถนน {road_text}"
+        title = first_present(first_event.get("description"), props.get("iconCategory"), "TomTom incident")
+
+        events.append(
+            {
+                "source": "TomTom",
+                "source_id": str(first_present(props.get("id"), f"tomtom-{len(events)}")),
+                "title": str(title or "TomTom incident"),
+                "description": str(description or "ข้อมูลเหตุจราจรจาก TomTom"),
+                "lat": lat,
+                "lng": lng,
+                "start": parse_event_time(props.get("startTime")),
+                "severity": str(first_present(props.get("magnitudeOfDelay"), props.get("iconCategory"), "")),
+                "icon": str(first_present(props.get("iconCategory"), item.get("type"), "tomtom")),
+            }
+        )
+
+    return events[:20]
+
+
+def merge_multisource_realtime_events(provinces: list[str], labels: list[str] | None = None) -> list[dict[str, Any]]:
+    route_points = get_route_points(provinces, labels)
+    events: list[dict[str, Any]] = []
+    events.extend(fetch_realtime_events())
+    events.extend(fetch_exat_events_for_route(route_points))
+    events.extend(fetch_here_events_for_route(route_points))
+    events.extend(fetch_tomtom_events_for_route(route_points))
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in events:
+        if not is_traffic_related_event(event):
+            continue
+        key = "|".join(
+            [
+                str(event.get("source") or ""),
+                str(event.get("source_id") or ""),
+                str(event.get("title") or "")[:80].lower(),
+                str(event.get("start") or ""),
+                str(round(float(event.get("lat") or 0), 3)),
+                str(round(float(event.get("lng") or 0), 3)),
+            ]
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(event)
+    return deduped
+
+
+def is_traffic_related_event(event: dict[str, Any]) -> bool:
+    text = f"{event.get('title', '')} {event.get('description', '')} {event.get('icon', '')}".lower()
+    traffic_keywords = [
+        "อุบัติเหตุ",
+        "รถเสีย",
+        "ชน",
+        "กีดขวาง",
+        "จราจร",
+        "ติดขัด",
+        "ปิดเบี่ยง",
+        "accident",
+        "breakdown",
+        "crash",
+        "traffic",
+        "jam",
+        "congestion",
+        "road",
+        "lane",
+    ]
+    blocked_keywords = ["เพลิงไหม้", "fire", "flood rescue", "earthquake"]
+    return any(keyword in text for keyword in traffic_keywords) and not any(keyword in text for keyword in blocked_keywords)
+
+
+def event_priority_score(event: dict[str, Any]) -> int:
+    text = f"{event.get('title', '')} {event.get('description', '')} {event.get('icon', '')}".lower()
+    score = 0
+
+    source = str(event.get("source") or "")
+    if source == "EXAT":
+        score += 5
+    elif source in {"HERE", "TomTom"}:
+        score += 4
+    elif source == "Longdo/iTIC":
+        score += 2
+
+    if any(keyword in text for keyword in ["อุบัติเหตุ", "รถเสีย", "ชน", "กีดขวาง", "accident", "breakdown", "crash"]):
+        score += 10
+    if any(keyword in text for keyword in ["traffic", "jam", "congestion", "ปิดการจราจร", "จราจร", "ติดขัด"]):
+        score += 4
+
+    severity = safe_float(event.get("severity"))
+    if severity is not None:
+        score += int(severity)
+
+    start_text = str(event.get("start") or "").strip()
+    if start_text:
+        try:
+            parsed = datetime.fromisoformat(start_text.replace("Z", "+00:00"))
+            now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+            age_hours = abs((now - parsed).total_seconds()) / 3600
+            if age_hours <= 6:
+                score += 4
+            elif age_hours <= 24:
+                score += 2
+            elif age_hours > 72 and "roadworks" not in text:
+                score -= 2
+        except Exception:
+            pass
+
+    return score
+
+
+def point_to_segment_distance_km(
+    lat: float,
+    lng: float,
+    start_lat: float,
+    start_lng: float,
+    end_lat: float,
+    end_lng: float,
+) -> float:
+    mean_lat = radians((start_lat + end_lat + lat) / 3)
+    km_per_deg_lat = 111.32
+    km_per_deg_lng = 111.32 * cos(mean_lat)
+
+    px = lng * km_per_deg_lng
+    py = lat * km_per_deg_lat
+    ax = start_lng * km_per_deg_lng
+    ay = start_lat * km_per_deg_lat
+    bx = end_lng * km_per_deg_lng
+    by = end_lat * km_per_deg_lat
+
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+    ab2 = abx * abx + aby * aby
+    if ab2 == 0:
+        return sqrt((px - ax) ** 2 + (py - ay) ** 2)
+
+    t = max(0.0, min(1.0, (apx * abx + apy * aby) / ab2))
+    closest_x = ax + t * abx
+    closest_y = ay + t * aby
+    return sqrt((px - closest_x) ** 2 + (py - closest_y) ** 2)
+
+
+def filter_events_near_route(
+    provinces: list[str], labels: list[str] | None = None, radius_km: float = REALTIME_ROUTE_RADIUS_KM
+) -> list[dict[str, Any]]:
+    events = merge_multisource_realtime_events(provinces, labels)
+    if not events:
+        return []
+
+    route_points = [(lat, lng) for _, lat, lng in get_route_points(provinces, labels)]
+    if len(route_points) < 2:
+        ranked = sorted(events, key=event_priority_score, reverse=True)
+        return ranked[:5]
+
+    matched: list[dict[str, Any]] = []
+    for event in events:
+        lat = event.get("lat")
+        lng = event.get("lng")
+        if lat is None or lng is None:
+            continue
+
+        best_distance = float("inf")
+        for (start_lat, start_lng), (end_lat, end_lng) in zip(route_points, route_points[1:]):
+            distance = point_to_segment_distance_km(float(lat), float(lng), start_lat, start_lng, end_lat, end_lng)
+            best_distance = min(best_distance, distance)
+
+        if best_distance <= radius_km:
+            matched.append({**event, "route_distance_km": round(best_distance, 1)})
+
+    matched = sorted(
+        matched,
+        key=lambda item: (-event_priority_score(item), float(item.get("route_distance_km") or 999), str(item.get("start") or "")),
+    )
+    relevant = [event for event in matched if event_priority_score(event) > 0]
+    return (relevant or matched)[:8]
+
+
+def weather_code_to_text(code: int | None) -> str:
+    mapping = {
+        0: "ท้องฟ้าโปร่ง",
+        1: "แดดจัด",
+        2: "มีเมฆบางส่วน",
+        3: "เมฆมาก",
+        45: "มีหมอก",
+        48: "หมอกจัด",
+        51: "ฝนละอองเบา",
+        53: "ฝนละอองปานกลาง",
+        55: "ฝนละอองหนัก",
+        61: "ฝนเบา",
+        63: "ฝนปานกลาง",
+        65: "ฝนหนัก",
+        80: "ฝนซู่เบา",
+        81: "ฝนซู่ปานกลาง",
+        82: "ฝนซู่หนัก",
+        95: "พายุฝนฟ้าคะนอง",
+    }
+    return mapping.get(int(code or 0), "สภาพอากาศทั่วไป")
+
+
+def fetch_current_weather_for_route(
+    provinces: list[str], labels: list[str] | None = None, max_points: int = 3, max_age_seconds: int = 900
+) -> list[dict[str, Any]]:
+    deduped = get_route_points(provinces, labels)
+    if not deduped:
+        return []
+
+    if len(deduped) > max_points:
+        middle = deduped[len(deduped) // 2]
+        deduped = [deduped[0], middle, deduped[-1]] if len(deduped) >= 3 else deduped[:max_points]
+
+    cache_key = "|".join([f"{label}:{lat:.3f}:{lng:.3f}" for label, lat, lng in deduped])
+    now = time.time()
+    cache_items = _weather_cache.get("items") or {}
+    cached = cache_items.get(cache_key)
+    if cached and now - float(cached.get("fetched_at") or 0) <= max_age_seconds:
+        return list(cached.get("snapshots") or [])
+
+    try:
+        latitudes = ",".join([str(lat) for _, lat, _ in deduped])
+        longitudes = ",".join([str(lng) for _, _, lng in deduped])
+        response = http.get(
+            OPEN_METEO_URL,
+            params={
+                "latitude": latitudes,
+                "longitude": longitudes,
+                "current": "temperature_2m,precipitation,rain,weather_code,wind_speed_10m",
+            },
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        items = payload if isinstance(payload, list) else [payload]
+
+        snapshots: list[dict[str, Any]] = []
+        for idx, item in enumerate(items):
+            current = item.get("current") or {}
+            label = deduped[idx][0] if idx < len(deduped) else f"จุดที่ {idx + 1}"
+            snapshots.append(
+                {
+                    "label": label,
+                    "time": str(current.get("time") or ""),
+                    "temperature_c": current.get("temperature_2m"),
+                    "rain_mm": current.get("rain") if current.get("rain") is not None else current.get("precipitation"),
+                    "precipitation_mm": current.get("precipitation"),
+                    "wind_kmh": current.get("wind_speed_10m"),
+                    "weather_code": current.get("weather_code"),
+                    "condition": weather_code_to_text(current.get("weather_code")),
+                }
+            )
+
+        cache_items[cache_key] = {"fetched_at": now, "snapshots": snapshots}
+        _weather_cache["items"] = cache_items
+        _weather_cache["fetched_at"] = now
+        return snapshots
+    except Exception:
+        return list(cached.get("snapshots") or []) if cached else []
+
+
+def build_realtime_fallback(
+    route_title: str,
+    provinces: list[str],
+    dist_km: float,
+    nearby_events: list[dict[str, Any]],
+    current_weather: list[dict[str, Any]],
+    history_summary: list[str],
+    risk_points: list[dict[str, Any]],
+    weather_info: str,
+    web_summary: str = "",
+    sources_checked: list[str] | None = None,
+) -> str:
+    lines: list[str] = [f"อัปเดตเหตุจราจรล่าสุดสำหรับเส้นทาง: {route_title}"]
+    if provinces:
+        lines.append(f"แนวเส้นทางหลัก: {' -> '.join(provinces)}")
+    if dist_km > 0:
+        lines.append(f"ระยะทางโดยประมาณ: {dist_km:.0f} กม.")
+
+    live_sources = sources_checked or sorted({str(event.get('source') or '') for event in nearby_events if event.get('source')})
+    if live_sources:
+        lines.append(f"แหล่งข้อมูลสดที่ตรวจสอบ: {', '.join(live_sources)}")
+
+    lines.append("")
+    if nearby_events:
+        lines.append(f"เหตุการณ์สดใกล้แนวเส้นทางพบ {len(nearby_events)} จุด:")
+        for idx, event in enumerate(nearby_events[:4], start=1):
+            detail = str(event.get("description") or event.get("title") or "").replace("\r", " ").replace("\n", " ").strip()
+            if len(detail) > 180:
+                detail = detail[:177] + "..."
+            when = f" | เวลา {event['start']}" if event.get("start") else ""
+            distance_note = f" | ใกล้แนวเส้นทางประมาณ {event['route_distance_km']} กม." if event.get("route_distance_km") is not None else ""
+            source = f"[{event.get('source', 'source')}] " if event.get('source') else ""
+            lines.append(f"{idx}. {source}{event.get('title', 'เหตุจราจร')} — {detail}{distance_note}{when}")
+    else:
+        lines.append("เหตุการณ์สด: ยังไม่พบอุบัติเหตุหรือเหตุจราจรเด่นใกล้แนวเส้นทางจาก feed ล่าสุด")
+
+    if web_summary:
+        lines.append("")
+        lines.append("ข้อมูลเว็บสาธารณะเพิ่มเติมผ่าน OpenAI:")
+        for item in str(web_summary).splitlines()[:6]:
+            if item.strip():
+                lines.append(item.strip())
+
+    if current_weather:
+        lines.append("")
+        lines.append("สภาพอากาศล่าสุดตามแนวเส้นทาง:")
+        for item in current_weather[:3]:
+            rain = float(item.get("rain_mm") or 0)
+            rain_note = f", ฝน {rain:.1f} มม." if rain > 0 else ""
+            wind = item.get("wind_kmh")
+            wind_note = f", ลม {float(wind):.0f} กม./ชม." if wind is not None else ""
+            temp = item.get("temperature_c")
+            temp_note = f"{float(temp):.1f}°C" if temp is not None else "ไม่ทราบอุณหภูมิ"
+            lines.append(f"- {item['label']}: {item['condition']} {temp_note}{rain_note}{wind_note}")
+
+    if risk_points:
+        lines.append("")
+        lines.append("จุดเสี่ยงจากสถิติย้อนหลัง:")
+        for idx, row in enumerate(risk_points[:4], start=1):
+            line = build_risk_point_line(row)
+            lines.append(f"{idx}. {line[2:] if line.startswith('- ') else line}")
+
+    if history_summary:
+        lines.append("")
+        lines.append("ภาพรวมจาก dataset ย้อนหลัง:")
+        for summary in history_summary[:3]:
+            lines.append(summary)
+
+    if weather_info and weather_info != "ไม่มีข้อมูลสภาพอากาศ":
+        lines.append("")
+        lines.append("สภาพอากาศที่เคยพบร่วมกับอุบัติเหตุ:")
+        for item in weather_info.splitlines()[:3]:
+            if item.strip():
+                lines.append(item.strip())
+
+    lines.append("")
+    source_summary = ", ".join(live_sources + ["Open-Meteo", "RoadBot dataset"]) if live_sources else "Longdo/iTIC, Open-Meteo, RoadBot dataset"
+    lines.append(f"แหล่งข้อมูล: {source_summary}")
+    return "\n".join(lines)
+
+
+def answer_realtime_with_llm(question: str, context: str, fallback: str) -> str:
+    prompt = (
+        "คุณคือ RoadBot AI ผู้ช่วยข้อมูลอุบัติเหตุและการเดินทางในไทย\n"
+        "จงสรุปคำตอบแบบมืออาชีพ เป็นภาษาไทย ใช้เฉพาะข้อมูลที่ให้มาเท่านั้น\n"
+        "ต้องตอบให้ครบและอ่านง่าย โดยเรียงหัวข้อดังนี้:\n"
+        "1) สรุปตอนนี้\n2) เหตุการณ์สดตามเส้นทาง\n3) จุดเสี่ยงจากสถิติย้อนหลัง\n4) คำแนะนำการเดินทาง\n5) แหล่งข้อมูล\n"
+        "ห้ามแต่งข้อมูลเพิ่ม และถ้าไม่พบเหตุการณ์สดให้บอกตรง ๆ\n\n"
+        f"Context:\n{context}\n\n"
+        f"คำถาม: {question}\nคำตอบ:"
+    )
+    answer = llm_invoke(prompt)
+    return answer if answer else fallback
+
+
+def format_realtime_route_answer(question: str, route_context: dict[str, Any]) -> str:
+    origin = route_context.get("origin")
+    destination = route_context.get("destination")
+    waypoints = route_context.get("waypoints") or []
+    labels = route_context.get("place_labels") or []
+
+    if origin and destination:
+        provinces, dist_km = get_route_provinces(origin, destination, waypoints)
+        nearby_events = filter_events_near_route(provinces, labels)
+        risk_points = extract_route_risk_points(provinces, limit_per_province=2, total_limit=6)
+        weather_info = get_weather_summary(provinces)
+        current_weather = fetch_current_weather_for_route(provinces, labels)
+        history_summary = [build_province_stats_summary(province) for province in provinces[:3]]
+        route_title = " -> ".join(labels or [origin, destination])
+        web_summary = fetch_openai_web_realtime_summary(question, route_title, provinces, nearby_events, current_weather)
+        sources_checked = ["Longdo/iTIC", "EXAT"]
+        if web_summary:
+            sources_checked.append("OpenAI Web Search")
+        if HERE_API_KEY:
+            sources_checked.append("HERE")
+        if TOMTOM_API_KEY:
+            sources_checked.append("TomTom")
+
+        event_lines = []
+        for idx, event in enumerate(nearby_events[:5], start=1):
+            detail = str(event.get("description") or event.get("title") or "").replace("\r", " ").replace("\n", " ").strip()
+            event_lines.append(
+                f"- {idx}. [{event.get('source', 'source')}] {event.get('title', 'เหตุจราจร')} | รายละเอียด: {detail} | เวลา: {event.get('start') or '-'} | ระยะห่างจากแนวเส้นทางประมาณ: {event.get('route_distance_km', '-')} กม."
+            )
+
+        weather_lines = []
+        for item in current_weather:
+            weather_lines.append(
+                f"- {item['label']}: {item['condition']}, อุณหภูมิ {item.get('temperature_c', '-') }°C, ฝน {item.get('rain_mm', 0)} มม., ลม {item.get('wind_kmh', '-') } กม./ชม."
+            )
+
+        risk_lines = [build_risk_point_line(row) for row in risk_points[:5]]
+        history_lines = history_summary[:3]
+
+        context = (
+            f"เส้นทางที่ถาม: {route_title}\n"
+            f"จังหวัดตามแนวเส้นทาง: {' -> '.join(provinces) if provinces else '-'}\n"
+            f"ระยะทางโดยประมาณ: {dist_km:.0f} กม.\n"
+            f"แหล่งข้อมูลสดที่ตรวจสอบ: {', '.join(sources_checked)}\n\n"
+            f"เหตุการณ์สดจากหลายแหล่ง:\n{chr(10).join(event_lines) if event_lines else '- ไม่พบเหตุการณ์เด่นใกล้แนวเส้นทาง'}\n\n"
+            f"สรุปจาก OpenAI Web Search:\n{web_summary or '- ไม่พบข้อมูลเว็บเพิ่มเติมที่เชื่อถือได้'}\n\n"
+            f"สภาพอากาศล่าสุดจาก Open-Meteo:\n{chr(10).join(weather_lines) if weather_lines else '- ไม่มีข้อมูลสภาพอากาศล่าสุด'}\n\n"
+            f"จุดเสี่ยงจาก dataset ย้อนหลัง:\n{chr(10).join(risk_lines) if risk_lines else '- ไม่พบจุดเสี่ยงเด่น'}\n\n"
+            f"สรุปสถิติย้อนหลังรายจังหวัด:\n{chr(10).join(history_lines) if history_lines else '- ไม่มีข้อมูลสรุปเพิ่มเติม'}\n\n"
+            f"สภาพอากาศในอดีตที่พบบ่อยร่วมกับอุบัติเหตุ:\n{weather_info or 'ไม่มีข้อมูล'}"
+        )
+
+        fallback = build_realtime_fallback(
+            route_title=route_title,
+            provinces=provinces,
+            dist_km=dist_km,
+            nearby_events=nearby_events,
+            current_weather=current_weather,
+            history_summary=history_summary,
+            risk_points=risk_points,
+            weather_info=weather_info,
+            web_summary=web_summary,
+            sources_checked=sources_checked,
+        )
+        return answer_realtime_with_llm(question, context, fallback)
+
+    events = fetch_realtime_events()
+    if not events:
+        return "ยังดึงข้อมูล real-time ไม่สำเร็จในขณะนี้ แต่ dataset ย้อนหลังยังใช้งานได้ตามปกติ"
+
+    lines = ["อัปเดตเหตุจราจรล่าสุดจาก Longdo/iTIC feed:"]
+    for idx, event in enumerate(sorted(events, key=event_priority_score, reverse=True)[:5], start=1):
+        detail = event.get("description") or event.get("title")
+        when = f" | เวลา {event['start']}" if event.get("start") else ""
+        lines.append(f"{idx}. {event.get('title', 'เหตุจราจร')} — {detail}{when}")
+    lines.append("")
+    lines.append("แหล่งข้อมูล: Longdo/iTIC realtime feed")
     return "\n".join(lines)
 
 
@@ -1351,15 +2402,28 @@ def answer_with_llm(question: str, context: str, fallback: str) -> str:
 def ask_roadbot(question: str, top_k: int, embedding_model: str) -> tuple[str, list[dict[str, Any]]]:
     q_type = classify_question(question)
 
-    if q_type in {"realtime", "irrelevant"}:
+    if q_type == "irrelevant":
         return (
-            "ขออภัยค่ะ ระบบนี้ให้บริการเฉพาะข้อมูลสถิติอุบัติเหตุย้อนหลังเท่านั้น "
-            "ไม่สามารถให้ข้อมูลเรียลไทม์หรือตอบคำถามที่ไม่เกี่ยวข้องได้ค่ะ",
+            "ขออภัยค่ะ ระบบนี้เน้นตอบเรื่องอุบัติเหตุ เส้นทาง และข้อมูลจราจรที่เกี่ยวข้องเท่านั้น",
             [],
         )
 
+    route_context = build_route_context(question)
+
+    if q_type == "realtime":
+        refs: list[dict[str, Any]] = []
+        for province in route_context.get("waypoints") or []:
+            refs.extend(fetch_docs_for_province(province, limit=4))
+        if route_context.get("origin"):
+            refs.extend(fetch_docs_for_province(route_context["origin"], limit=4))
+        if route_context.get("destination"):
+            refs.extend(fetch_docs_for_province(route_context["destination"], limit=6))
+        return format_realtime_route_answer(question, route_context), refs[:20]
+
     if q_type == "route_analysis":
-        origin, destination, waypoints = extract_origin_destination(question)
+        origin = route_context.get("origin")
+        destination = route_context.get("destination")
+        waypoints = route_context.get("waypoints") or []
         if origin and destination:
             filtered_waypoints, removed = filter_unreasonable_waypoints(
                 origin,
@@ -1381,6 +2445,9 @@ def ask_roadbot(question: str, top_k: int, embedding_model: str) -> tuple[str, l
                 risk_points=risk_points,
                 weather_info=weather_info,
                 removed_waypoint_notes=removed,
+                origin_label=route_context.get("origin_label"),
+                destination_label=route_context.get("destination_label"),
+                waypoint_labels=route_context.get("waypoint_labels") or [],
             )
 
             docs: list[dict[str, Any]] = []
@@ -1499,6 +2566,7 @@ def status() -> dict[str, Any]:
         "index_path": resolve_data_path(os.getenv("FAISS_INDEX_PATH", "./data/faiss.index")),
         "meta_path": resolve_data_path(os.getenv("FAISS_META_PATH", "./data/faiss_meta.json")),
         "groq_ready": bool(get_llm() is not None),
+        "llm_provider": _state.get("llm_provider", "none"),
     }
 
 

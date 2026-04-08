@@ -112,15 +112,20 @@ function isHistoricalAccidentQuestion(text) {
 }
 
 function getGuardrailReply(text) {
-  if (isRealtimeQuestion(text)) {
-    return REALTIME_ONLY_MESSAGE;
-  }
-
-  if (!isHistoricalAccidentQuestion(text)) {
+  const message = String(text || "").trim();
+  if (!message) {
     return HISTORY_ONLY_MESSAGE;
   }
 
-  return null;
+  const looksLikeRouteQuestion = ["จาก", "ไป", "ผ่าน", "แวะ", "route", "พระราม", "บางแสน", "พัทยา"].some(
+    (keyword) => message.includes(keyword)
+  );
+
+  if (isRealtimeQuestion(message) || isHistoricalAccidentQuestion(message) || looksLikeRouteQuestion) {
+    return null;
+  }
+
+  return HISTORY_ONLY_MESSAGE;
 }
 
 function hasIndexMissingMessage(text) {

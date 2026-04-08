@@ -10,6 +10,12 @@ const envSchema = z.object({
   BOT_API_TOKEN: z.string().min(16),
 
   PY_RAG_URL: z.string().default("http://127.0.0.1:8001"),
+  OPENAI_API_KEY: z.string().optional(),
+  OPENAI_MODEL_NAME: z.string().default("gpt-4o-mini"),
+  LONGDO_EVENT_URL: z.string().default("https://event.longdo.com/feed/json"),
+  EXAT_API_BASE_URL: z.string().default("https://exat-man.web.app/api"),
+  OPENAI_WEB_SEARCH_ENABLED: z.string().default("true"),
+  OPENAI_WEB_MODEL: z.string().default("gpt-4.1-mini"),
   QWEN_MODEL_NAME: z.string().default("Qwen/Qwen2.5-1.5B-Instruct"),
   EMBEDDING_MODEL_NAME: z.string().default(
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
