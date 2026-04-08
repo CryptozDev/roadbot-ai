@@ -1,0 +1,28 @@
+# Workspace virtual environments
+.venv/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Dependencies
+**/node_modules/
+
+# Logs and caches
+*.log
+coverage/
+.tmp/
+tmp/
+__pycache__/
+*.py[cod]
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Generated FAISS artifacts
+roadbotai-backend/data/faiss.index
+roadbotai-backend/data/faiss_meta.json

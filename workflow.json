@@ -1,0 +1,158 @@
+{
+  "name": "Roadbot AI Ver.n8n Discord",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "roadbotai-n8n-discord",
+        "options": {}
+      },
+      "id": "f75365cb-4618-46f5-b681-f33b723446d2",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -3488,
+        -624
+      ],
+      "webhookId": "c56784ce-e3b8-41d3-83a2-cc8d9475165c"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body || $json;\nconst message = String(body.content || '').trim();\nif (!message) {\n  return [];\n}\nreturn [{\n  json: {\n    message,\n    channelId: String(body.channel_id || ''),\n    username: String(body.author?.username || 'discord-user'),\n    userId: String(body.author?.id || ''),\n    source: 'discord-botpy'\n  }\n}];"
+      },
+      "id": "137edeef-80e9-4d4f-91b2-a58059c86215",
+      "name": "Extract Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3248,
+        -624
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://uncombining-dianna-hedonistic.ngrok-free.dev/api/chat/bot",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-bot-token",
+              "value": "roadbot_n8n_discord_2026_4kY7mP2xL9vQ8sT1nR6cW3zH"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"message\": $('Extract Payload').item.json.message } }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "2585c9a7-393d-49f1-a3c9-badc14520226",
+      "name": "Call RoadBotAI Backend",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        -2992,
+        -624
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const req = $('Extract Payload').item.json;\nconst raw = String($json.answer || $json.data?.answer || '⚠️ ระบบยังไม่พร้อมตอบ กรุณาลองใหม่');\n\nfunction clip(text, max) {\n  return text.length > max \n    ? text.slice(0, max - 80) + '\\n\\n... (ตัดข้อความ)'\n    : text;\n}\n\n// clean + จัด paragraph\nfunction format(text) {\n  return text\n    .replace(/```/g, '')\n    .replace(/\\r/g, '')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .trim();\n}\n\nconst question = String(req.message || 'ไม่มีคำถาม');\nconst answerRaw = format(clip(raw, 3500));\nconst username = String(req.username || 'ผู้ใช้');\nconst userId = String(req.userId || '');\n\nconst logo = 'https://img1.pic.in.th/images/roadbotailogo.png';\nconst iconlogo = 'https://img1.pic.in.th/images/rbaibf27db76afa900b4.png';\n\n// 🔥 แยก intro กับเนื้อหา\nlet preview = answerRaw.slice(0, 300);\nlet full = answerRaw.slice(300);\n\n// กันตัดคำมั่ว\nif (answerRaw.length <= 300) {\n  preview = answerRaw;\n  full = '';\n}\n\nreturn [{\n  json: {\n    content: userId ? `<@${userId}> 🔔 มีคำตอบแล้ว` : '',\n    embeds: [\n      {\n        color: 0x2F6FED,\n\n        author: { \n          name: `🙋 ${username} ถามว่า`,\n          icon_url: iconlogo\n        },\n\n        title: `❓ ${question}`,\n\n        // 🔥 intro อ่านง่าย\n        description: `🤖 **RoadBot AI ตอบ**\\n━━━━━━━━━━━━━━━\\n${preview}`,\n\n        fields: full\n          ? [\n              {\n                name: '📍 รายละเอียดเพิ่มเติม',\n                value: full.length > 1000 ? full.slice(0, 1000) + '\\n...' : full\n              }\n            ]\n          : [],\n\n        thumbnail: {\n          url: iconlogo\n        },\n\n        image: {\n          url: logo\n        },\n\n        footer: { \n          text: '🗺️ RoadBot AI • ระบบข้อมูลถนนอัจฉริยะ' \n        },\n\n        timestamp: new Date().toISOString()\n      }\n    ]\n  }\n}];"
+      },
+      "id": "d8d83ebc-ef12-41a4-bfaf-e76257d4b272",
+      "name": "Format Discord Webhook",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2752,
+        -624
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://discord.com/api/webhooks/1488744177633198190/8SXr0eixQ2cM-BOY2IWQIZwdur1KEpwjyWwqFGUYnSWYG3EKXFQ1qTssA1H4cq8gBqDg",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json}}",
+        "options": {}
+      },
+      "id": "961bd14c-35c6-4016-b653-8947761c8b4d",
+      "name": "Send Discord Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        -2512,
+        -624
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Payload": {
+      "main": [
+        [
+          {
+            "node": "Call RoadBotAI Backend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call RoadBotAI Backend": {
+      "main": [
+        [
+          {
+            "node": "Format Discord Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Discord Webhook": {
+      "main": [
+        [
+          {
+            "node": "Send Discord Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "c46cabe6-c542-4a40-a6fb-2d3e222dc743",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "c6ea936472e83d981fde2e1f0a8b6d61fe0dc6b54f3a7d1b0fae6f08b4334cee"
+  },
+  "id": "c2ZuwJ4s6qFWDYxz",
+  "tags": []
+}

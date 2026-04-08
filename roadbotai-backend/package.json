@@ -1,0 +1,26 @@
+{
+  "name": "roadbotai-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run dev:cleanports && concurrently -k -n API,RAG -c cyan,magenta \"npm run dev:api\" \"npm run dev:rag\"",
+    "dev:cleanports": "kill-port 4000 8001 || echo ports-available",
+    "dev:api": "nodemon --watch \"src\" --ext js,mjs,cjs,json --ignore \"data/**\" --ignore \"rag_service/**\" --ignore \"node_modules/**\" src/server.js",
+    "dev:rag": "node scripts/runRag.mjs",
+    "start": "node src/server.js",
+    "ingest:sheet": "node scripts/ingestSheet.js",
+    "rag:python": "node scripts/runRag.mjs"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "kill-port": "^2.0.1",
+    "nodemon": "^3.1.7"
+  }
+}

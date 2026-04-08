@@ -1,0 +1,10 @@
+{
+  "name": "roadbotai-discord-n8n",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Discord relay bot for Roadbot AI Ver.n8n Discord",
+  "scripts": {
+    "bot": "node scripts/runBot.mjs",
+    "bot:venv": "node scripts/runBot.mjs"
+  }
+}
