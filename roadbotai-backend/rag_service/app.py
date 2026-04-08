@@ -178,7 +178,6 @@ _state: dict[str, Any] = {
     "texts": [],
     "df": pd.DataFrame(),
     "weather_summary": {},
-    "province_centroids": {},
     "llm": None,
     "index": None,
     "index_path": "",
@@ -334,33 +333,6 @@ def build_weather_summary(df: pd.DataFrame) -> dict[str, dict[str, int]]:
     return summary
 
 
-def build_province_centroids(df: pd.DataFrame) -> dict[str, tuple[float, float]]:
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return {}
-
-    required_columns = {"province", "lat", "lng"}
-    if not required_columns.issubset(df.columns):
-        return {}
-
-    coords_df = df[["province", "lat", "lng"]].copy()
-    coords_df["province"] = coords_df["province"].astype(str).apply(
-        lambda value: normalize_province_name(value) or value
-    )
-    coords_df["lat_num"] = pd.to_numeric(coords_df["lat"], errors="coerce")
-    coords_df["lng_num"] = pd.to_numeric(coords_df["lng"], errors="coerce")
-    coords_df = coords_df.dropna(subset=["lat_num", "lng_num"])
-    if coords_df.empty:
-        return {}
-
-    centroids: dict[str, tuple[float, float]] = {}
-    for province, group in coords_df.groupby("province"):
-        centroids[str(province)] = (
-            float(group["lat_num"].median()),
-            float(group["lng_num"].median()),
-        )
-    return centroids
-
-
 def save_meta(meta_path: str, payload: dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
     with open(meta_path, "w", encoding="utf-8") as file_obj:
@@ -406,9 +378,6 @@ def load_state_from_meta(payload: dict[str, Any]) -> None:
         df["province"] = df["province"].apply(lambda x: normalize_province_name(str(x)) or str(x))
     _state["df"] = df
     _state["weather_summary"] = payload.get("weather_summary") or build_weather_summary(_state["df"])
-    _state["province_centroids"] = build_province_centroids(df)
-    geocode.cache_clear()
-    reverse_geocode_province.cache_clear()
 
 
 def prepare_runtime(sheet_url: str, gid: str, embedding_model: str, index_path: str, meta_path: str) -> dict[str, Any]:
@@ -461,13 +430,10 @@ def prepare_runtime(sheet_url: str, gid: str, embedding_model: str, index_path: 
     _state["texts"] = texts
     _state["df"] = df
     _state["weather_summary"] = weather_summary
-    _state["province_centroids"] = build_province_centroids(df)
     _state["index"] = index
     _state["index_path"] = index_path
     _state["meta_path"] = meta_path
     _state["embedding_model"] = embedding_model
-    geocode.cache_clear()
-    reverse_geocode_province.cache_clear()
 
     return payload
 
@@ -895,11 +861,6 @@ def infer_route_provinces_with_llm(
 @lru_cache(maxsize=256)
 def geocode(place_name: str) -> tuple[float | None, float | None]:
     normalized = normalize_province_name(place_name) or place_name
-    centroids = _state.get("province_centroids") or {}
-    if normalized in centroids:
-        lat, lng = centroids[normalized]
-        return float(lat), float(lng)
-
     queries = [
         f"{normalized}, Thailand",
         f"จังหวัด{normalized}, Thailand",
@@ -918,10 +879,6 @@ def geocode(place_name: str) -> tuple[float | None, float | None]:
                 },
                 timeout=20,
             )
-            if response.status_code == 429:
-                break
-            if response.status_code != 200:
-                continue
             data = response.json()
             if data:
                 return float(data[0]["lat"]), float(data[0]["lon"])
@@ -952,24 +909,6 @@ def detour_metrics(origin: str, waypoint: str, destination: str) -> tuple[float 
     via = haversine_km(orig_lat, orig_lng, wp_lat, wp_lng) + haversine_km(wp_lat, wp_lng, dest_lat, dest_lng)
     extra = via - direct
     return direct, via, extra
-
-
-def estimate_route_distance_km(origin: str, destination: str, waypoints: list[str] | None = None) -> float:
-    ordered_points = combine_ordered_provinces(origin, waypoints or [], destination)
-    if len(ordered_points) < 2:
-        return 0
-
-    total_km = 0.0
-    for start, end in zip(ordered_points, ordered_points[1:]):
-        start_lat, start_lng = geocode(start)
-        end_lat, end_lng = geocode(end)
-        if None in (start_lat, start_lng, end_lat, end_lng):
-            return 0
-
-        straight_km = haversine_km(start_lat, start_lng, end_lat, end_lng)
-        total_km += max(straight_km * 1.22, straight_km + 20)
-
-    return round(total_km, 1)
 
 
 def filter_unreasonable_waypoints(
@@ -1025,31 +964,12 @@ def filter_unreasonable_waypoints(
 
 @lru_cache(maxsize=2048)
 def reverse_geocode_province(lat: float, lng: float) -> str | None:
-    centroids = _state.get("province_centroids") or {}
-    if centroids:
-        nearest_province = None
-        nearest_distance = None
-        for province, (p_lat, p_lng) in centroids.items():
-            try:
-                distance = haversine_km(lat, lng, float(p_lat), float(p_lng))
-            except Exception:
-                continue
-
-            if nearest_distance is None or distance < nearest_distance:
-                nearest_province = str(province)
-                nearest_distance = distance
-
-        if nearest_province and (nearest_distance is None or nearest_distance <= 220):
-            return nearest_province
-
     try:
         response = http.get(
             "https://nominatim.openstreetmap.org/reverse",
             params={"lat": lat, "lon": lng, "format": "jsonv2"},
             timeout=5,
         )
-        if response.status_code in {429, 403}:
-            return None
         if response.status_code != 200:
             return None
         addr = response.json().get("address", {})
@@ -1094,12 +1014,11 @@ def build_sensible_route(
 
 def get_route_provinces(origin: str, destination: str, waypoints: list[str] | None = None) -> tuple[list[str], float]:
     waypoints = combine_ordered_provinces(waypoints or [])
-    fallback_distance_km = estimate_route_distance_km(origin, destination, waypoints)
 
     orig_lat, orig_lng = geocode(origin)
     dest_lat, dest_lng = geocode(destination)
     if orig_lat is None or dest_lat is None:
-        return build_sensible_route(origin, destination, waypoints), fallback_distance_km
+        return build_sensible_route(origin, destination, waypoints), 0
 
     coords_str = f"{orig_lng},{orig_lat}"
     for waypoint in waypoints:
@@ -1116,10 +1035,10 @@ def get_route_provinces(origin: str, destination: str, waypoints: list[str] | No
         )
         data = response.json()
     except Exception:
-        return build_sensible_route(origin, destination, waypoints), fallback_distance_km
+        return build_sensible_route(origin, destination, waypoints), 0
 
     if data.get("code") != "Ok":
-        return build_sensible_route(origin, destination, waypoints), fallback_distance_km
+        return build_sensible_route(origin, destination, waypoints), 0
 
     coords = data["routes"][0]["geometry"]["coordinates"]
     distance_km = float(data["routes"][0]["distance"]) / 1000
@@ -1137,7 +1056,7 @@ def get_route_provinces(origin: str, destination: str, waypoints: list[str] | No
     if len(route_result) < 3:
         route_result = combine_ordered_provinces(origin, found_provinces, waypoints, destination)
 
-    return route_result or combine_ordered_provinces(origin, waypoints, destination), distance_km or fallback_distance_km
+    return route_result or combine_ordered_provinces(origin, waypoints, destination), distance_km
 
 
 def retrieve_refs(question: str, top_k: int, embedding_model: str) -> list[dict[str, Any]]:
