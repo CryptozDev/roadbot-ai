@@ -5,6 +5,9 @@
 .env
 .env.*
 !.env.example
+!roadbotai-backend/.env.example
+!roadbotai-discord-n8n/.env.bot.example
+!roadbotai-discord-n8n/.env.n8n.example
 
 # Dependencies
 **/node_modules/

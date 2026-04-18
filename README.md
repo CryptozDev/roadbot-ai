@@ -134,6 +134,9 @@ npm install
 กำหนดค่าไฟล์:
 - `roadbotai-backend/.env`
 - `roadbotai-discord-n8n/.env.bot`
+- `roadbotai-backend/.env.example`
+- `roadbotai-discord-n8n/.env.bot.example`
+- `roadbotai-discord-n8n/.env.n8n.example`
 
 ตัวอย่างค่าที่ใช้งาน:
 
@@ -144,6 +147,10 @@ GROQ_API_KEY=your_key
 DEFAULT_SHEET_URL=your_google_sheet_url
 DEFAULT_SHEET_GID=0
 ```
+
+> ใช้ไฟล์ตัวอย่างเพื่อคัดลอกและสร้างไฟล์ `.env` จริงก่อนรันระบบ
+
+> ไฟล์ `Exampledocx.md` มีโครงคู่มือสำหรับให้ทำต่อเป็น PDF/DOCX ได้เลย
 
 ### 4. Run project
 
