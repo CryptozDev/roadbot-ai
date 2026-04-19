@@ -37,6 +37,7 @@ RoadBot AI คือแชตบอตสำหรับตอบคำถาม
 - `Discord Bot` — Chat Interface
 - `n8n` — Workflow Automation / Integration
 - `Google Sheet / local dataset` — Data Source
+- `Longdo Map API + EXAT API + OpenAI Web Search` — Realtime Data Source
 
 ---
 
