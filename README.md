@@ -106,7 +106,7 @@ roadbot-ai/
 ### 1. Clone repo
 
 ```bash
-git clone https://github.com/your-repo/roadbot-ai.git
+git clone https://github.com/CryptozDev/roadbot-ai.git
 cd roadbot-ai
 ```
 
