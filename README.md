@@ -142,16 +142,53 @@ npm install
 ตัวอย่างค่าที่ใช้งาน:
 
 ```env
-BOT_API_TOKEN=your_token
+# RoadBotAI backend environment example
+# Copy this file to roadbotai-backend/.env and fill the values.
+
+PORT=4000
+NODE_ENV=development
+FRONTEND_ORIGIN=*
+BOT_API_TOKEN=roadbot_n8n_discord_2026_XXXX
 PY_RAG_URL=http://127.0.0.1:8001
-GROQ_API_KEY=your_key
-DEFAULT_SHEET_URL=your_google_sheet_url
+QWEN_MODEL_NAME=Qwen/Qwen2.5-1.5B-Instruct
+EMBEDDING_MODEL_NAME=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+FAISS_INDEX_PATH=./data/faiss.index
+FAISS_META_PATH=./data/faiss_meta.json
+TOP_K=6
+DEFAULT_SHEET_URL=https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit
 DEFAULT_SHEET_GID=0
+RAG_CHAT_TIMEOUT_MS=45000
+RAG_INGEST_TIMEOUT_MS=300000
+RAG_TIMEOUT_MS=180000
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_MODEL_NAME=gpt-4o-mini
+LONGDO_EVENT_URL=https://event.longdo.com/feed/json
+EXAT_API_BASE_URL=https://exat-man.web.app/api
+OPENAI_WEB_SEARCH_ENABLED=true
+OPENAI_WEB_MODEL=gpt-4.1-mini
+REALTIME_ROUTE_RADIUS_KM=12
+```
+
+```env
+# Discord bot environment example
+# Copy this file to .env.bot and fill the values.
+
+DISCORD_BOT_TOKEN=your_discord_bot_token
+N8N_WEBHOOK_URL=http://localhost:5678/webhook/roadbotai-n8n-discord
+BOT_COMMAND_PREFIXES=!roadbot,!rb
+```
+
+```env
+# n8n environment example for RoadBot AI workflow
+# Use these variables in your n8n instance or .env file.
+
+ROADBOT_BACKEND_URL=http://localhost:4000/api/chat/bot
+ROADBOT_BOT_TOKEN=roadbot_n8n_discord_2026_XXXX
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/xxx/yyy
 ```
 
 > ใช้ไฟล์ตัวอย่างเพื่อคัดลอกและสร้างไฟล์ `.env` จริงก่อนรันระบบ
 
-> ไฟล์ `Exampledocx.md` มีโครงคู่มือสำหรับให้ทำต่อเป็น PDF/DOCX ได้เลย
 
 ### 4. Run project
 
