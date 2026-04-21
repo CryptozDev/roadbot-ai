@@ -108,6 +108,7 @@ roadbot-ai/
 ```bash
 git clone https://github.com/CryptozDev/roadbot-ai.git
 cd roadbot-ai
+code .
 ```
 
 ### 2. Install dependencies
